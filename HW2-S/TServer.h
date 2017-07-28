@@ -12,12 +12,20 @@ typedef struct{
     char* out_filename;    //5
     //int* ports;
 } InputArg;
+
+//Agent info
+typedef struct{
+    int port_agent;
+    int connection_count;
+}agent_info;
+
 //Flight
 typedef struct{
 	char* FlightName;
 	int AvailableSeats;
 	int MaxSeats;
 }FlightInfo;
+
 //Client
 typedef struct{
 	char* name;
@@ -33,6 +41,8 @@ typedef struct{
 pthread_mutex_t mutexFlight;
 pthread_mutex_t mutexClient;
 pthread_mutex_t mutexViper;
+pthread_mutex_t mutexClientCount;
+pthread_cond_t condClientCount;
 
 pthread_cond_t viper;
 int ON;

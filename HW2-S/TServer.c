@@ -22,17 +22,19 @@ int main(int argc, char *argv[])
     }
 
     //Get input args
-    InputArg *marg = (InputArg*)malloc(sizeof(InputArg));
-    marg->ip_address = argv[1];
-    marg->start_port = argv[2];
-    marg->no_ports = atoi(argv[3]);
-    marg->in_filename = argv[4];
-    marg->out_filename = argv[5];
+    InputArg *serverArguments = (InputArg*)malloc(sizeof(InputArg));
+    serverArguments->ip_address = argv[1];
+    serverArguments->start_port = argv[2];
+    serverArguments->no_ports = atoi(argv[3]);
+    serverArguments->in_filename = argv[4];
+    serverArguments->out_filename = argv[5];
 
     //create stuff
     pthread_mutex_init(&mutexFlight,NULL);
     pthread_mutex_init(&mutexClient,NULL);
     pthread_mutex_init(&mutexViper,NULL);
+    pthread_mutex_init(&mutexClientCount,NULL);
+    pthread_cond_init(&condClientCount, NULL);
     ON = 1;
 
     pthread_cond_init(&viper, NULL);
@@ -42,12 +44,12 @@ int main(int argc, char *argv[])
     //map for clients
     client_map = hashmap_new();
     //initalize hashmap with data from txt
-    readInput(marg->in_filename, flight_map);
+    readInput(serverArguments->in_filename, flight_map);
     //initialize
     pthread_t tidC;
     pthread_t tidSM;
-    pthread_create(&tidC, NULL, server, marg);
-    pthread_create(&tidSM, NULL, TsocketManager, marg);
+    pthread_create(&tidC, NULL, server, serverArguments);
+    pthread_create(&tidSM, NULL, TsocketManager, serverArguments);
 
     pthread_join(tidC, NULL);
     pthread_join(tidSM, NULL);
@@ -56,6 +58,8 @@ int main(int argc, char *argv[])
     pthread_mutex_destroy(&mutexClient);
     pthread_mutex_destroy(&mutexViper);
     pthread_cond_destroy(&viper);
+    pthread_mutex_destroy(&mutexClientCount);
+    pthread_cond_destroy(&condClientCount);
 
     //free maps
     forEachFree(flight_map);
@@ -193,7 +197,7 @@ void writeOutput(char * fileName, map_t flight_map)
 void* server(void* arg)
 {
     printf("server: server Has Launch!\n");
-    InputArg* marg = (InputArg*) arg;
+    InputArg* serverArguments = (InputArg*) arg;
     size_t bytes_read;
     size_t nbytes = 0;
     char *servInput = NULL;
@@ -222,8 +226,8 @@ void* server(void* arg)
         }
         else if(strcmp(servInput,"WRITE") == 0)
         {
-            printf("server: Writing Data to '%s'.\n",marg->out_filename);
-            writeOutput(marg->out_filename,flight_map);
+            printf("server: Writing Data to '%s'.\n",serverArguments->out_filename);
+            writeOutput(serverArguments->out_filename,flight_map);
         }
         else
         {
@@ -268,32 +272,40 @@ void listInChat()
 
 void* TsocketManager(void* arg)
 {
-    InputArg *marg = (InputArg*) arg;
+    InputArg *serverArguments = (InputArg*) arg;
     //create multiple agents to handle each port
-    pthread_t tidAgent[marg->no_ports];
-    int ports[marg->no_ports];
-    for(int i = 0; i < marg->no_ports; i++)
-        ports[i] = getPort(marg->start_port, i);
-    for(int i = 0; i < marg->no_ports; i++)
-        pthread_create(&tidAgent[i], NULL, agent, &ports[i]);
+    pthread_t tidAgent[serverArguments->no_ports];
+    //int ports[serverArguments->no_ports];
+    agent_info* agentInfo[serverArguments->no_ports];
+    for(int i = 0; i < serverArguments->no_ports; i++)
+    {
+        //ports[i] = getPort(serverArguments->start_port, i);
+        agentInfo[i]->connection_count = 0;
+        agentInfo[i]->port_agent = getPort(serverArguments->start_port, i);
+        {
+            for(int i = 0; i < serverArguments->no_ports; i++)
+                pthread_create(&tidAgent[i], NULL, agent, agentInfo[i]);
 
-    pthread_mutex_lock(&mutexViper);
-    pthread_cond_wait(&viper, &mutexViper);
-    pthread_mutex_unlock(&mutexViper);
-    for(int i = 0; i < marg->no_ports; i++)
-        pthread_cancel(tidAgent[i]);
-    for(int i = 0; i < marg->no_ports; i++)
-        pthread_join(tidAgent[i], NULL);
-    pthread_exit(NULL);
+            pthread_mutex_lock(&mutexViper);
+            pthread_cond_wait(&viper, &mutexViper);
+            pthread_mutex_unlock(&mutexViper);
+            for(int i = 0; i < serverArguments->no_ports; i++)
+                pthread_cancel(tidAgent[i]);
+            for(int i = 0; i < serverArguments->no_ports; i++)
+                pthread_join(tidAgent[i], NULL);
+            pthread_exit(NULL);
+        }
+    }
 }
 
-void* agent(void* arg)
+void* agent(void* agent_info_struct)
 {
+    agent_info* agentInfo = (agent_info*)agent_info_struct;
     int BUFFER_SIZE = 256;
     char buffer[BUFFER_SIZE];
     pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
     int sockfd,
-        portno = *((int*) arg),
+        portno = agentInfo->port_agent,
         optval = 1;
     struct sockaddr_in serv_addr, cli_addr;
     socklen_t clilen = sizeof(cli_addr);
@@ -349,6 +361,35 @@ void* agent(void* arg)
         pthread_create(&Client->tid, NULL, client, Client);
         hashmap_put(client_map, Client->name, Client);
         pthread_mutex_unlock(&mutexClient);
+
+        //Increment the client count and going to sleep if serve 10 clients, 100 clients or 1000 client if the
+        //Agent is odd.
+        struct timespec timeToWait;
+        struct timeval now;
+        pthread_mutex_lock(&mutexClientCount);
+        agentInfo->connection_count++;
+        pthread_mutex_unlock(&mutexClientCount);
+        switch(agentInfo->connection_count)
+        {
+        case 10:    //when the agent has served 10 client.
+            timeToWait.tv_sec = now.tv_sec + 5;
+            timeToWait.tv_nsec = (now.tv_usec + 1000UL * 100) * 1000UL;
+            pthread_cond_timedwait(&condClientCount,&mutexClientCount, &timeToWait);
+            break;
+
+        case 100:   //when the agent has served 100 client.
+            timeToWait.tv_sec = now.tv_sec+5;
+            timeToWait.tv_nsec = (now.tv_usec+1000UL*250)*1000UL;
+            pthread_cond_timedwait(&condClientCount,&mutexClientCount, &timeToWait);
+            break;
+
+        case 1000:  //send the agent to close the connection if the agent is odd
+            if(agentInfo->port_agent & 1)
+            {
+                close(sockfd);
+                break;
+            }
+        }
     }
     close(sockfd);
     printf("TsocketManager: IN agent: '%d' Has Terminated!\n", portno);
@@ -630,7 +671,7 @@ void listAvailable(int clientSockfd,char* buffer, int BUFFER_SIZE)
     sWrite(clientSockfd,"client: Listing all available flights:\n");
     sWrite(clientSockfd,"\tFlight\t\tAvailable Seats\t\tMax Seats\n");
     pthread_mutex_lock(&mutexFlight);
-     hashmap_map* map = ( hashmap_map*) flight_map;
+    hashmap_map* map = ( hashmap_map*) flight_map;
     for (int i = 0; i < map->table_size; i++)
         if (map->data[i].in_use != 0)
         {
@@ -652,7 +693,7 @@ void listAvailableN(int clientSockfd,char* buffer, int BUFFER_SIZE, int n)
     memset(buffer, 0, BUFFER_SIZE);
     sWrite(clientSockfd,"\tFlight\t\tAvailable Seats\t\tMax Seats\n");
     pthread_mutex_lock(&mutexFlight);
-     hashmap_map* map = ( hashmap_map*) flight_map;
+    hashmap_map* map = ( hashmap_map*) flight_map;
     for (int i = 0,j = 0; (i < map->table_size) && (j < n); i++)
         if (map->data[i].in_use != 0)
         {
@@ -719,7 +760,7 @@ void writeToAllInChat(ClientInfo* client, char* buffer, int BUFFER_SIZE)
     memset(temp,0,BUFFER_SIZE);
     snprintf(temp, BUFFER_SIZE, "CHAT >> %s: %s\n", client->nickName, buffer);
     pthread_mutex_lock(&mutexClient);
-     hashmap_map* map = ( hashmap_map*) client_map;
+    hashmap_map* map = ( hashmap_map*) client_map;
     for (int i = 0; i < map->table_size; i++)
         if (map->data[i].in_use != 0)
         {
@@ -761,7 +802,7 @@ void listALLToChat(ClientInfo* client, int BUFFER_SIZE)
     char temp[BUFFER_SIZE];
     sWrite(client->sockfd, "CHAT: Listing all chat users:\n");
     pthread_mutex_lock(&mutexClient);
-     hashmap_map* map = ( hashmap_map*) client_map;
+    hashmap_map* map = ( hashmap_map*) client_map;
     for (int i = 0; i < map->table_size; i++)
         if (map->data[i].in_use != 0)
         {
@@ -789,6 +830,7 @@ void listOfflineToChat(ClientInfo* client, int BUFFER_SIZE)
     pthread_mutex_lock(&mutexClient);
     hashmap_map* map = (hashmap_map*) client_map;
     for (int i = 0; i < map->table_size; i++)
+    {
         if (map->data[i].in_use != 0)
         {
             others = (ClientInfo*) map->data[i].data;
@@ -800,6 +842,7 @@ void listOfflineToChat(ClientInfo* client, int BUFFER_SIZE)
                 count++;
             }
         }
+    }
     pthread_mutex_unlock(&mutexClient);
     memset(temp,0,BUFFER_SIZE);
     snprintf(temp, BUFFER_SIZE, "A total of %d users.\n", count);
